@@ -2,29 +2,58 @@ const express = require('express');
 const dotenv = require('dotenv');
 const cors = require('cors');
 const axios = require('axios');
-const cloudinary = require('cloudinary').v2; // For secure image uploads
-const crypto = require('crypto'); // Built-in Node.js module for security
-// ⚠️ IMPORTANT: You must install and configure Firebase Admin SDK
+const cloudinary = require('cloudinary').v2; 
+const crypto = require('crypto'); 
 const admin = require('firebase-admin'); 
 
 // Load environment variables from .env file
 dotenv.config();
 
-// Initialize Firebase Admin SDK
-// You must set the FIREBASE_SERVICE_ACCOUNT_KEY path in your .env
-// e.g., const serviceAccount = require(process.env.FIREBASE_SERVICE_ACCOUNT_KEY);
-// admin.initializeApp({ credential: admin.credential.cert(serviceAccount) });
-// const db = admin.firestore();
+// =================================================================
+// ⚠️ START: SECURE FIREBASE ADMIN SDK INITIALIZATION (Production Ready)
+// =================================================================
+
+// 1. Check for the secure environment variable and parse the JSON string.
+// This relies on you setting FIREBASE_CREDENTIALS_JSON in your hosting environment.
+let db;
+try {
+  if (!process.env.FIREBASE_CREDENTIALS_JSON) {
+    throw new Error("FIREBASE_CREDENTIALS_JSON environment variable is missing.");
+  }
+  
+  const serviceAccount = JSON.parse(process.env.FIREBASE_CREDENTIALS_JSON);
+  
+  // 2. Initialize Firebase Admin SDK with the credentials.
+  admin.initializeApp({ 
+    credential: admin.credential.cert(serviceAccount) 
+  });
+  
+  db = admin.firestore(); // Assign the Firestore instance
+  console.log('✅ Firebase Admin SDK initialized securely.');
+  
+} catch (error) {
+  // If initialization fails (missing variable, invalid JSON, etc.), log and exit.
+  console.error('❌ CRITICAL ERROR: Firebase Admin SDK initialization failed.', error.message);
+  // In a production app, stopping startup is usually the safest action.
+  process.exit(1); 
+}
+
+// =================================================================
+// ⚠️ END: SECURE FIREBASE ADMIN SDK INITIALIZATION
+// =================================================================
+
 
 const app = express();
 const PORT = process.env.PORT || 3000;
 const PAYSTACK_BASE_API = 'https://api.paystack.co';
 
 // --- Middlewares ---
-app.use(cors()); // Configure CORS to allow access from your mobile app domain
-app.use(express.json({ limit: '5mb' })); // To parse incoming JSON requests (increased limit for base64)
+app.use(cors()); 
+// General JSON parser for all non-webhook endpoints
+app.use(express.json({ limit: '5mb' })); 
 
 // --- Cloudinary Configuration (Secure Method) ---
+// Note: Relying on environment variables set in .env
 cloudinary.config({
   cloud_name: process.env.CLOUDINARY_CLOUD_NAME,
   api_key: process.env.CLOUDINARY_API_KEY,
@@ -33,13 +62,11 @@ cloudinary.config({
 });
 
 // ====================================================================
-// PAYSTACK PROXY ENDPOINTS (All use SECRET KEY stored on server)
+// PAYSTACK PROXY ENDPOINTS
 // ====================================================================
 
 // --- 1. Paystack Proxy Endpoint: Initialize Transaction ---
 app.post('/api/paystack/initialize', async (req, res) => {
-  // NOTE: Initial transaction save to Firestore must happen on the frontend (lib/paystack.ts)
-  // or be moved here if you pass the user's UID to this endpoint.
   try {
     const { amount, email, reference } = req.body;
     
@@ -64,7 +91,7 @@ app.post('/api/paystack/initialize', async (req, res) => {
     const errorMessage = error.response?.data?.message || 'Payment initialization failed.';
     res.status(500).json({ error: errorMessage });
   }
-})
+});
 
 // --- 1.1. Paystack Proxy Endpoint: Resolve Bank Account ---
 app.get('/api/paystack/resolve', async (req, res) => {
@@ -168,29 +195,30 @@ app.post('/api/paystack/transfer', async (req, res) => {
 });
 
 // --------------------------------------------------------------------
-// ✅ PAYSTACK WEBHOOK ENDPOINT (For secure automatic wallet crediting)
+// ✅ PAYSTACK WEBHOOK ENDPOINT (Uses express.raw for signature verification)
 // --------------------------------------------------------------------
-app.post('/api/paystack/webhook', async (req, res) => {
+// Use express.raw() middleware ONLY for this endpoint to get the raw body
+app.post('/api/paystack/webhook', express.raw({type: 'application/json'}), async (req, res) => {
   const secret = process.env.PAYSTACK_WEBHOOK_SECRET;
   
-  // 1. Verify Signature
+  // 1. Verify Signature (must use raw body)
   const hash = crypto.createHmac('sha512', secret)
-                     .update(JSON.stringify(req.body))
+                     .update(req.body) 
                      .digest('hex');
 
   if (hash !== req.headers['x-paystack-signature']) {
       console.warn('Webhook signature mismatch. Request ignored.');
-      // Return 200 to Paystack to prevent retries, but don't process data
       return res.status(200).send('Signature verification failed.');
   }
 
-  const event = req.body;
+  // Parse the raw body into a JSON object AFTER verification
+  const event = JSON.parse(req.body.toString()); 
   const reference = event.data?.reference;
 
   // 2. Process only successful charges
   if (event.event === 'charge.success' && reference) {
       try {
-          // 3. (Optional but recommended) Final Verification to prevent spoofing
+          // 3. (Recommended) Final Verification to prevent spoofing
           const verificationResponse = await axios.get(
               `${PAYSTACK_BASE_API}/transaction/verify/${reference}`,
               { headers: { Authorization: `Bearer ${process.env.PAYSTACK_SECRET_KEY}` } }
@@ -199,7 +227,6 @@ app.post('/api/paystack/webhook', async (req, res) => {
           const verifiedData = verificationResponse.data.data;
 
           if (verifiedData.status === 'success') {
-              // Extract the amount (in kobo) and convert to NGN
               const amountInKobo = verifiedData.amount;
               const amountInNGN = amountInKobo / 100;
               
@@ -209,12 +236,11 @@ app.post('/api/paystack/webhook', async (req, res) => {
 
               if (!txnSnap.exists) {
                   console.error(`Transaction record not found for reference: ${reference}`);
-                  // Still return 200, but log the error.
                   return res.status(200).send('Transaction record not found.');
               }
 
               const txnData = txnSnap.data();
-              const userId = txnData.userId; // ⚠️ Ensure you save 'userId' in the transaction document during 'initializePayment'
+              const userId = txnData.userId; 
               const userRef = db.collection('users').doc(userId);
 
               // Check if the transaction has already been processed (idempotency)
@@ -262,7 +288,6 @@ app.post('/api/paystack/webhook', async (req, res) => {
           console.error('Webhook processing failed:', error.message);
       }
   } else if (event.event === 'charge.failed') {
-      // Handle failed charges, e.g., update the Firestore transaction record to 'failed'
       console.log(`Charge failed for reference: ${reference}`);
   }
 
@@ -285,7 +310,7 @@ app.post('/api/vtpass/purchase', async (req, res) => {
     }
 
     const vtpassResponse = await axios.post(
-      `${process.env.VTPASS_BASE_URL}/pay`, // VTPASS pay endpoint
+      `${process.env.VTPASS_BASE_URL}pay`, 
       { serviceID, amount, phone, request_id, billersCode, variation_code },
       {
         headers: {
@@ -314,7 +339,7 @@ app.post('/api/vtpass/requery', async (req, res) => {
     }
 
     const vtpassResponse = await axios.post(
-      `${process.env.VTPASS_BASE_URL}/requery`, // VTPASS requery endpoint
+      `${process.env.VTPASS_BASE_URL}requery`, 
       { request_id },
       {
         headers: {
