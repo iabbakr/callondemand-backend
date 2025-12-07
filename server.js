@@ -3,9 +3,18 @@ const dotenv = require('dotenv');
 const cors = require('cors');
 const axios = require('axios');
 const cloudinary = require('cloudinary').v2; // For secure image uploads
+const crypto = require('crypto'); // Built-in Node.js module for security
+// ⚠️ IMPORTANT: You must install and configure Firebase Admin SDK
+const admin = require('firebase-admin'); 
 
 // Load environment variables from .env file
 dotenv.config();
+
+// Initialize Firebase Admin SDK
+// You must set the FIREBASE_SERVICE_ACCOUNT_KEY path in your .env
+// e.g., const serviceAccount = require(process.env.FIREBASE_SERVICE_ACCOUNT_KEY);
+// admin.initializeApp({ credential: admin.credential.cert(serviceAccount) });
+// const db = admin.firestore();
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -13,10 +22,9 @@ const PAYSTACK_BASE_API = 'https://api.paystack.co';
 
 // --- Middlewares ---
 app.use(cors()); // Configure CORS to allow access from your mobile app domain
-app.use(express.json()); // To parse incoming JSON requests
+app.use(express.json({ limit: '5mb' })); // To parse incoming JSON requests (increased limit for base64)
 
 // --- Cloudinary Configuration (Secure Method) ---
-// Initialize Cloudinary with the secure URL from the environment
 cloudinary.config({
   cloud_name: process.env.CLOUDINARY_CLOUD_NAME,
   api_key: process.env.CLOUDINARY_API_KEY,
@@ -29,8 +37,9 @@ cloudinary.config({
 // ====================================================================
 
 // --- 1. Paystack Proxy Endpoint: Initialize Transaction ---
-// Used by lib/paystack.ts initializePayment
 app.post('/api/paystack/initialize', async (req, res) => {
+  // NOTE: Initial transaction save to Firestore must happen on the frontend (lib/paystack.ts)
+  // or be moved here if you pass the user's UID to this endpoint.
   try {
     const { amount, email, reference } = req.body;
     
@@ -57,8 +66,7 @@ app.post('/api/paystack/initialize', async (req, res) => {
   }
 })
 
-// --- 1.1. Paystack Proxy Endpoint: Resolve Bank Account (NEWLY ADDED) ---
-// Used by AuthScreen.tsx verifyAccount to check user bank details
+// --- 1.1. Paystack Proxy Endpoint: Resolve Bank Account ---
 app.get('/api/paystack/resolve', async (req, res) => {
   try {
     const { account_number, bank_code } = req.query;
@@ -85,8 +93,7 @@ app.get('/api/paystack/resolve', async (req, res) => {
   }
 });
 
-// --- 1.2. Paystack Proxy Endpoint: Verify Transaction (NEWLY ADDED) ---
-// Needed to replace the insecure call in lib/paystack.ts verifyPayment
+// --- 1.2. Paystack Proxy Endpoint: Verify Transaction ---
 app.get('/api/paystack/verify/:reference', async (req, res) => {
   try {
     const { reference } = req.params;
@@ -108,8 +115,7 @@ app.get('/api/paystack/verify/:reference', async (req, res) => {
   }
 });
 
-// --- 1.3. Paystack Proxy Endpoint: Create Transfer Recipient (NEWLY ADDED) ---
-// Needed to replace the insecure call in lib/paystack.ts createTransferRecipient
+// --- 1.3. Paystack Proxy Endpoint: Create Transfer Recipient ---
 app.post('/api/paystack/recipient', async (req, res) => {
   try {
     const { name, account_number, bank_code, currency = 'NGN' } = req.body;
@@ -133,8 +139,7 @@ app.post('/api/paystack/recipient', async (req, res) => {
   }
 });
 
-// --- 1.4. Paystack Proxy Endpoint: Initiate Transfer/Withdrawal (NEWLY ADDED) ---
-// Needed to replace the insecure call in lib/paystack.ts withdrawToBank
+// --- 1.4. Paystack Proxy Endpoint: Initiate Transfer/Withdrawal ---
 app.post('/api/paystack/transfer', async (req, res) => {
   try {
     const { recipient, amount, reason = 'Wallet withdrawal' } = req.body;
@@ -162,13 +167,115 @@ app.post('/api/paystack/transfer', async (req, res) => {
   }
 });
 
+// --------------------------------------------------------------------
+// ✅ PAYSTACK WEBHOOK ENDPOINT (For secure automatic wallet crediting)
+// --------------------------------------------------------------------
+app.post('/api/paystack/webhook', async (req, res) => {
+  const secret = process.env.PAYSTACK_WEBHOOK_SECRET;
+  
+  // 1. Verify Signature
+  const hash = crypto.createHmac('sha512', secret)
+                     .update(JSON.stringify(req.body))
+                     .digest('hex');
+
+  if (hash !== req.headers['x-paystack-signature']) {
+      console.warn('Webhook signature mismatch. Request ignored.');
+      // Return 200 to Paystack to prevent retries, but don't process data
+      return res.status(200).send('Signature verification failed.');
+  }
+
+  const event = req.body;
+  const reference = event.data?.reference;
+
+  // 2. Process only successful charges
+  if (event.event === 'charge.success' && reference) {
+      try {
+          // 3. (Optional but recommended) Final Verification to prevent spoofing
+          const verificationResponse = await axios.get(
+              `${PAYSTACK_BASE_API}/transaction/verify/${reference}`,
+              { headers: { Authorization: `Bearer ${process.env.PAYSTACK_SECRET_KEY}` } }
+          );
+
+          const verifiedData = verificationResponse.data.data;
+
+          if (verifiedData.status === 'success') {
+              // Extract the amount (in kobo) and convert to NGN
+              const amountInKobo = verifiedData.amount;
+              const amountInNGN = amountInKobo / 100;
+              
+              // 4. Find the transaction and associated user in Firestore
+              const txnRef = db.collection('transactions').doc(reference);
+              const txnSnap = await txnRef.get();
+
+              if (!txnSnap.exists) {
+                  console.error(`Transaction record not found for reference: ${reference}`);
+                  // Still return 200, but log the error.
+                  return res.status(200).send('Transaction record not found.');
+              }
+
+              const txnData = txnSnap.data();
+              const userId = txnData.userId; // ⚠️ Ensure you save 'userId' in the transaction document during 'initializePayment'
+              const userRef = db.collection('users').doc(userId);
+
+              // Check if the transaction has already been processed (idempotency)
+              if (txnData.status === 'success') {
+                  console.warn(`Transaction ${reference} already processed.`);
+                  return res.status(200).send('Transaction already processed.');
+              }
+              
+              // 5. Update Wallet Balance and Transaction Status (Atomic Operation)
+              await db.runTransaction(async (t) => {
+                const userDoc = await t.get(userRef);
+                if (!userDoc.exists) throw new Error("User not found for crediting.");
+                
+                // Credit the user's balance
+                const newBalance = (userDoc.data().balance || 0) + amountInNGN;
+                t.update(userRef, { balance: newBalance });
+                
+                // Update transaction status to prevent double-crediting
+                t.update(txnRef, { 
+                    status: 'success', 
+                    verifiedAt: admin.firestore.FieldValue.serverTimestamp(),
+                    amount_credited: amountInNGN,
+                });
+
+                // Add a transaction record to the user's subcollection
+                const userTxRef = userRef.collection('transactions');
+                t.set(userTxRef.doc(), {
+                    description: `Wallet Top-up (Paystack)`,
+                    amount: amountInNGN,
+                    type: 'credit',
+                    category: 'Wallet Deposit',
+                    status: 'success',
+                    date: admin.firestore.FieldValue.serverTimestamp(),
+                    reference: reference,
+                });
+              });
+
+              console.log(`Successfully credited NGN ${amountInNGN} to user ${userId} for reference ${reference}.`);
+
+          } else {
+              // Verification failed (e.g., status is 'failed' or 'abandoned')
+              console.warn(`Paystack verification status not successful for reference: ${reference}. Status: ${verifiedData.status}`);
+          }
+      } catch (error) {
+          console.error('Webhook processing failed:', error.message);
+      }
+  } else if (event.event === 'charge.failed') {
+      // Handle failed charges, e.g., update the Firestore transaction record to 'failed'
+      console.log(`Charge failed for reference: ${reference}`);
+  }
+
+  // Paystack expects a 200 response to stop retrying.
+  res.status(200).send('Webhook Received');
+});
+
 
 // ====================================================================
-// VTPASS PROXY ENDPOINTS (All use SECRET KEY stored on server)
+// VTPASS PROXY ENDPOINTS
 // ====================================================================
 
 // --- 2. VTPASS Proxy Endpoint: Purchase Service ---
-// Used by lib/vtpass.ts buyAirtime, buyData, buyElectricity
 app.post('/api/vtpass/purchase', async (req, res) => {
   try {
     const { serviceID, amount, phone, request_id, billersCode, variation_code } = req.body;
@@ -197,8 +304,7 @@ app.post('/api/vtpass/purchase', async (req, res) => {
   }
 });
 
-// --- 2.1. VTPASS Proxy Endpoint: Requery Transaction Status (NEWLY ADDED) ---
-// Used by lib/vtpass.ts queryTransactionStatus
+// --- 2.1. VTPASS Proxy Endpoint: Requery Transaction Status ---
 app.post('/api/vtpass/requery', async (req, res) => {
   try {
     const { request_id } = req.body;
@@ -233,7 +339,6 @@ app.post('/api/vtpass/requery', async (req, res) => {
 // ====================================================================
 
 // --- 3. Cloudinary Secure Upload Endpoint ---
-// Used by lib/cloudinary.ts uploadImageToCloudinary
 app.post('/api/upload/image', async (req, res) => {
     try {
         const { fileUri } = req.body;
