@@ -10,7 +10,7 @@ dotenv.config();
 let db;
 try {
   if (!process.env.FIREBASE_CREDENTIALS_JSON) {
-    throw new Error("FIREBASE_CREDENTIALS_JSON variable is missing.");
+    throw new Error("FIREBASE_CREDENTIALS_JSON environment variable is missing.");
   }
   const serviceAccount = JSON.parse(process.env.FIREBASE_CREDENTIALS_JSON);
   admin.initializeApp({ credential: admin.credential.cert(serviceAccount) });
@@ -27,17 +27,15 @@ const PAYSTACK_BASE_API = 'https://api.paystack.co';
 
 app.use(cors()); 
 
-// Webhook logic (express.raw) remains identical for signature verification...
+// Deposit Webhook Logic (Remains identical for top-ups)
 app.post('/api/paystack/webhook', express.raw({type: 'application/json'}), async (req, res) => {
   const secret = process.env.PAYSTACK_WEBHOOK_SECRET;
-  const signature = req.headers['x-paystack-signature'];
   const hash = crypto.createHmac('sha512', secret).update(req.body).digest('hex');
-  if (hash !== signature) return res.status(200).send('Invalid Signature');
+  if (hash !== req.headers['x-paystack-signature']) return res.status(200).send('Invalid Signature');
 
   const event = JSON.parse(req.body.toString()); 
-  const reference = event.data?.reference;
-
-  if (event.event === 'charge.success' && reference) {
+  if (event.event === 'charge.success') {
+      const reference = event.data?.reference;
       try {
           const vRes = await axios.get(`${PAYSTACK_BASE_API}/transaction/verify/${reference}`, {
               headers: { Authorization: `Bearer ${process.env.PAYSTACK_SECRET_KEY}` }
@@ -56,14 +54,6 @@ app.post('/api/paystack/webhook', express.raw({type: 'application/json'}), async
               await db.runTransaction(async (t) => {
                 t.update(userRef, { balance: admin.firestore.FieldValue.increment(amountInNGN) });
                 t.update(txnRef, { status: 'success', verifiedAt: admin.firestore.FieldValue.serverTimestamp() });
-                t.set(userRef.collection('transactions').doc(), {
-                    description: `Wallet Top-up`,
-                    amount: amountInNGN,
-                    type: 'credit',
-                    category: 'Wallet Deposit',
-                    status: 'success',
-                    date: admin.firestore.FieldValue.serverTimestamp(),
-                });
               });
           }
       } catch (error) { console.error('Webhook Error:', error.message); }
@@ -73,10 +63,10 @@ app.post('/api/paystack/webhook', express.raw({type: 'application/json'}), async
 
 app.use(express.json({ limit: '5mb' })); 
 
-// --- SECURE TRANSFER ENDPOINT ---
+// --- SECURE WITHDRAWAL ENDPOINT ---
 app.post('/api/paystack/transfer', async (req, res) => {
   const { userId, amount, recipientCode } = req.body;
-  if (!userId || !amount || !recipientCode) return res.status(400).json({ error: 'Missing data' });
+  if (!userId || !amount || !recipientCode) return res.status(400).json({ error: 'Missing required fields' });
 
   const userRef = db.collection('users').doc(userId);
   const transferId = `WITHDRAW-${Date.now()}`;
@@ -87,15 +77,15 @@ app.post('/api/paystack/transfer', async (req, res) => {
       if (!userSnap.exists) throw new Error('User not found');
       
       const balance = userSnap.data().balance || 0;
-      if (balance < amount) throw new Error('Insufficient balance');
+      if (balance < amount) throw new Error('Insufficient wallet balance');
 
-      // 1. DEDUCT LOCALLY FIRST
+      // 1. DEDUCT LOCALLY FIRST (Within transaction)
       t.update(userRef, { balance: admin.firestore.FieldValue.increment(-amount) });
 
-      // 2. TRIGGER PAYSTACK
+      // 2. TRIGGER PAYSTACK API
       const pRes = await axios.post(`${PAYSTACK_BASE_API}/transfer`, {
         source: "balance",
-        amount: amount * 100,
+        amount: amount * 100, // Kobo
         recipient: recipientCode,
         reason: "Wallet Withdrawal",
         reference: transferId
@@ -103,7 +93,7 @@ app.post('/api/paystack/transfer', async (req, res) => {
         headers: { Authorization: `Bearer ${process.env.PAYSTACK_SECRET_KEY}` }
       });
 
-      // 3. LOG TRANSACTION
+      // 3. LOG TRANSACTION DOC
       const txnRef = db.collection('transactions').doc(transferId);
       t.set(txnRef, {
         userId, amount, type: 'debit', status: 'success',
@@ -114,6 +104,7 @@ app.post('/api/paystack/transfer', async (req, res) => {
     });
     res.json({ status: true, data: result });
   } catch (error) {
+    console.error('Transfer Error:', error.message);
     res.status(400).json({ error: error.message });
   }
 });
@@ -129,4 +120,4 @@ app.post('/api/paystack/initialize', async (req, res) => {
   } catch (error) { res.status(500).json({ error: 'Init failed' }); }
 });
 
-app.listen(PORT, () => console.log(`🚀 Server on port ${PORT}`));
+app.listen(PORT, () => console.log(`🚀 Production server on port ${PORT}`));
