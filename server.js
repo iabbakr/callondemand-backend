@@ -120,4 +120,32 @@ app.post('/api/paystack/initialize', async (req, res) => {
   } catch (error) { res.status(500).json({ error: 'Init failed' }); }
 });
 
+// --- NEW SECURE ACCOUNT RESOLUTION ENDPOINT ---
+app.get('/api/paystack/resolve', async (req, res) => {
+  const { account_number, bank_code } = req.query;
+
+  if (!account_number || !bank_code) {
+    return res.status(400).json({ error: 'Account number and bank code are required' });
+  }
+
+  try {
+    const response = await axios.get(
+      `${PAYSTACK_BASE_API}/bank/resolve?account_number=${account_number}&bank_code=${bank_code}`,
+      {
+        headers: {
+          Authorization: `Bearer ${process.env.PAYSTACK_SECRET_KEY}`,
+        },
+      }
+    );
+
+    // Return the data back to the mobile app
+    res.json(response.data);
+  } catch (error) {
+    console.error('Paystack Resolve Error:', error.response?.data || error.message);
+    const status = error.response?.status || 500;
+    const message = error.response?.data?.message || 'Could not verify account';
+    res.status(status).json({ error: message });
+  }
+});
+
 app.listen(PORT, () => console.log(`🚀 Production server on port ${PORT}`));
