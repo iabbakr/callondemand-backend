@@ -33,6 +33,12 @@ cloudinary.config({
   api_secret: process.env.CLOUDINARY_API_SECRET,
 });
 
+// Verify Cloudinary config on startup
+console.log('🔧 Cloudinary Config:');
+console.log('Cloud Name:', process.env.CLOUDINARY_CLOUD_NAME ? '✅ Set' : '❌ Missing');
+console.log('API Key:', process.env.CLOUDINARY_API_KEY ? '✅ Set' : '❌ Missing');
+console.log('API Secret:', process.env.CLOUDINARY_API_SECRET ? '✅ Set' : '❌ Missing');
+
 app.use(cors());
 
 // --- ROUTES ---
@@ -92,32 +98,65 @@ app.use(express.json({ limit: '10mb' }));
  */
 app.post('/api/upload/image', async (req, res) => {
   try {
+    console.log('📥 Received upload request');
+    
     const { fileUri, oldImagePublicId } = req.body; 
     
-    if (!fileUri) return res.status(400).json({ error: "No image data provided" });
+    if (!fileUri) {
+      console.error('❌ No image data provided');
+      return res.status(400).json({ error: "No image data provided" });
+    }
+
+    console.log('📊 File URI length:', fileUri.length);
+    console.log('🗑️  Old Public ID:', oldImagePublicId || 'None');
+
+    // Verify Cloudinary config
+    if (!process.env.CLOUDINARY_CLOUD_NAME || !process.env.CLOUDINARY_API_KEY || !process.env.CLOUDINARY_API_SECRET) {
+      console.error('❌ Cloudinary credentials missing');
+      return res.status(500).json({ error: "Cloudinary not configured properly" });
+    }
 
     // Delete old asset if it exists
     if (oldImagePublicId) {
       try {
-        await cloudinary.uploader.destroy(oldImagePublicId);
-        console.log(`Deleted: ${oldImagePublicId}`);
+        console.log('🗑️  Attempting to delete old image:', oldImagePublicId);
+        const deleteResult = await cloudinary.uploader.destroy(oldImagePublicId);
+        console.log('🗑️  Delete result:', deleteResult);
       } catch (err) {
-        console.warn("Cleanup failed, proceeding with upload");
+        console.warn("⚠️ Cleanup failed:", err.message);
+        // Continue with upload even if deletion fails
       }
     }
 
+    console.log('📤 Uploading to Cloudinary...');
     const result = await cloudinary.uploader.upload(fileUri, {
       folder: 'profile_pictures',
-      resource_type: 'image'
+      resource_type: 'image',
+      transformation: [
+        { width: 500, height: 500, crop: 'limit' }, // Optimize size
+        { quality: 'auto' }
+      ]
     });
+
+    console.log('✅ Upload successful!');
+    console.log('URL:', result.secure_url);
+    console.log('Public ID:', result.public_id);
 
     res.json({ 
       url: result.secure_url,
       publicId: result.public_id 
     });
   } catch (error) {
-    console.error('Cloudinary Route Error:', error);
-    res.status(500).json({ error: 'Failed to upload to Cloudinary' });
+    console.error('❌ Cloudinary Route Error:');
+    console.error('Message:', error.message);
+    console.error('Stack:', error.stack);
+    
+    // Return detailed error for debugging
+    res.status(500).json({ 
+      error: 'Failed to upload to Cloudinary',
+      message: error.message,
+      details: process.env.NODE_ENV === 'development' ? error.stack : undefined
+    });
   }
 });
 
