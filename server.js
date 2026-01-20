@@ -38,8 +38,14 @@ app.use(cors());
 // --- ROUTES ---
 
 /**
+ * 0. HEALTH CHECK (For Render Monitoring)
+ */
+app.get('/health', (req, res) => {
+  res.status(200).send('Server is alive');
+});
+
+/**
  * 1. PAYSTACK WEBHOOK
- * Must stay above express.json() to handle raw body signature verification
  */
 app.post('/api/paystack/webhook', express.raw({ type: 'application/json' }), async (req, res) => {
   const secret = process.env.PAYSTACK_WEBHOOK_SECRET;
@@ -78,12 +84,11 @@ app.post('/api/paystack/webhook', express.raw({ type: 'application/json' }), asy
   res.status(200).send('Webhook Received');
 });
 
-// Middleware for parsing JSON (Applied after raw webhook to allow large image payloads)
+// Middleware for parsing JSON (10MB limit for Base64 images)
 app.use(express.json({ limit: '10mb' }));
 
 /**
  * 2. SECURE CLOUDINARY UPLOAD & CLEANUP
- * Handles uploading new images and deleting old ones to save space.
  */
 app.post('/api/upload/image', async (req, res) => {
   try {
@@ -91,39 +96,37 @@ app.post('/api/upload/image', async (req, res) => {
     
     if (!fileUri) return res.status(400).json({ error: "No image data provided" });
 
-    // 1. Delete the old image if a Public ID was provided by the frontend
+    // Delete old asset if it exists
     if (oldImagePublicId) {
       try {
         await cloudinary.uploader.destroy(oldImagePublicId);
-        console.log(`Successfully deleted old asset: ${oldImagePublicId}`);
-      } catch (deleteError) {
-        console.warn('Failed to delete old image, continuing with upload:', deleteError.message);
+        console.log(`Deleted: ${oldImagePublicId}`);
+      } catch (err) {
+        console.warn("Cleanup failed, proceeding with upload");
       }
     }
 
-    // 2. Upload the new image
     const result = await cloudinary.uploader.upload(fileUri, {
       folder: 'profile_pictures',
       resource_type: 'image'
     });
 
-    // Return the secure URL and the new public_id to be stored in Firestore
     res.json({ 
       url: result.secure_url,
       publicId: result.public_id 
     });
   } catch (error) {
-    console.error('Cloudinary Upload/Delete Error:', error);
-    res.status(500).json({ error: 'Failed to process image on Cloudinary' });
+    console.error('Cloudinary Route Error:', error);
+    res.status(500).json({ error: 'Failed to upload to Cloudinary' });
   }
 });
 
 /**
- * 3. SECURE WITHDRAWAL (TRANSFER)
+ * 3. SECURE WITHDRAWAL
  */
 app.post('/api/paystack/transfer', async (req, res) => {
   const { userId, amount, recipientCode } = req.body;
-  if (!userId || !amount || !recipientCode) return res.status(400).json({ error: 'Missing required fields' });
+  if (!userId || !amount || !recipientCode) return res.status(400).json({ error: 'Missing fields' });
 
   const userRef = db.collection('users').doc(userId);
   const transferId = `WITHDRAW-${Date.now()}`;
@@ -134,12 +137,10 @@ app.post('/api/paystack/transfer', async (req, res) => {
       if (!userSnap.exists) throw new Error('User not found');
 
       const balance = userSnap.data().balance || 0;
-      if (balance < amount) throw new Error('Insufficient wallet balance');
+      if (balance < amount) throw new Error('Insufficient balance');
 
-      // Deduct balance locally
       t.update(userRef, { balance: admin.firestore.FieldValue.increment(-amount) });
 
-      // Trigger Paystack
       const pRes = await axios.post(`${PAYSTACK_BASE_API}/transfer`, {
         source: "balance",
         amount: amount * 100,
@@ -150,7 +151,6 @@ app.post('/api/paystack/transfer', async (req, res) => {
         headers: { Authorization: `Bearer ${process.env.PAYSTACK_SECRET_KEY}` }
       });
 
-      // Log Transaction
       const txnRef = db.collection('transactions').doc(transferId);
       t.set(txnRef, {
         userId, amount, type: 'debit', status: 'success',
@@ -161,13 +161,12 @@ app.post('/api/paystack/transfer', async (req, res) => {
     });
     res.json({ status: true, data: result });
   } catch (error) {
-    console.error('Transfer Error:', error.message);
     res.status(400).json({ error: error.message });
   }
 });
 
 /**
- * 4. INITIALIZE PAYMENT (DEPOSIT)
+ * 4. INITIALIZE PAYMENT
  */
 app.post('/api/paystack/initialize', async (req, res) => {
   try {
@@ -187,25 +186,15 @@ app.post('/api/paystack/initialize', async (req, res) => {
  */
 app.get('/api/paystack/resolve', async (req, res) => {
   const { account_number, bank_code } = req.query;
-
-  if (!account_number || !bank_code) {
-    return res.status(400).json({ error: 'Account number and bank code are required' });
-  }
-
   try {
     const response = await axios.get(
       `${PAYSTACK_BASE_API}/bank/resolve?account_number=${account_number}&bank_code=${bank_code}`,
-      {
-        headers: { Authorization: `Bearer ${process.env.PAYSTACK_SECRET_KEY}` },
-      }
+      { headers: { Authorization: `Bearer ${process.env.PAYSTACK_SECRET_KEY}` } }
     );
     res.json(response.data);
   } catch (error) {
-    console.error('Paystack Resolve Error:', error.response?.data || error.message);
-    const status = error.response?.status || 500;
-    const message = error.response?.data?.message || 'Could not verify account';
-    res.status(status).json({ error: message });
+    res.status(500).json({ error: 'Account resolution failed' });
   }
 });
 
-app.listen(PORT, () => console.log(`🚀 Production server on port ${PORT}`));
+app.listen(PORT, () => console.log(`🚀 Render Server active on port ${PORT}`));
