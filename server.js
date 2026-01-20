@@ -82,22 +82,39 @@ app.post('/api/paystack/webhook', express.raw({ type: 'application/json' }), asy
 app.use(express.json({ limit: '10mb' }));
 
 /**
- * 2. SECURE CLOUDINARY UPLOAD
+ * 2. SECURE CLOUDINARY UPLOAD & CLEANUP
+ * Handles uploading new images and deleting old ones to save space.
  */
 app.post('/api/upload/image', async (req, res) => {
   try {
-    const { fileUri } = req.body; // Base64 string from Expo
+    const { fileUri, oldImagePublicId } = req.body; 
+    
     if (!fileUri) return res.status(400).json({ error: "No image data provided" });
 
+    // 1. Delete the old image if a Public ID was provided by the frontend
+    if (oldImagePublicId) {
+      try {
+        await cloudinary.uploader.destroy(oldImagePublicId);
+        console.log(`Successfully deleted old asset: ${oldImagePublicId}`);
+      } catch (deleteError) {
+        console.warn('Failed to delete old image, continuing with upload:', deleteError.message);
+      }
+    }
+
+    // 2. Upload the new image
     const result = await cloudinary.uploader.upload(fileUri, {
       folder: 'profile_pictures',
       resource_type: 'image'
     });
 
-    res.json({ url: result.secure_url });
+    // Return the secure URL and the new public_id to be stored in Firestore
+    res.json({ 
+      url: result.secure_url,
+      publicId: result.public_id 
+    });
   } catch (error) {
-    console.error('Cloudinary Upload Error:', error);
-    res.status(500).json({ error: 'Failed to upload image to Cloudinary' });
+    console.error('Cloudinary Upload/Delete Error:', error);
+    res.status(500).json({ error: 'Failed to process image on Cloudinary' });
   }
 });
 
