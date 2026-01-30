@@ -321,6 +321,73 @@ app.get('/api/paystack/resolve', async (req, res) => {
   }
 });
 
+/**
+ * SYSTEM BROADCAST (Target all users)
+ * Triggered from Admin Dashboard
+ */
+app.post('/api/notifications/broadcast', async (req, res) => {
+  try {
+    const { title, body, type, data } = req.body;
+
+    if (!title || !body) {
+      return res.status(400).json({ error: 'Title and Body are required' });
+    }
+
+    console.log('📢 Starting system-wide broadcast...');
+
+    // 1. Fetch all users who have a valid push token
+    const usersSnap = await db.collection('users')
+      .where('expoPushToken', '!=', null)
+      .get();
+
+    if (usersSnap.empty) {
+      return res.json({ success: true, sentCount: 0, message: 'No devices registered' });
+    }
+
+    // 2. Map tokens into Expo message format
+    const messages = usersSnap.docs.map(doc => ({
+      to: doc.data().expoPushToken,
+      sound: 'default',
+      title: title,
+      body: body,
+      data: { 
+        ...data, 
+        type: type || 'admin_notification',
+        sentAt: new Date().toISOString() 
+      },
+    }));
+
+    // 3. Chunk messages (Expo recommends batches of 100)
+    const chunks = [];
+    while (messages.length > 0) {
+      chunks.push(messages.splice(0, 100));
+    }
+
+    // 4. Send chunks to Expo API
+    const sendPromises = chunks.map(chunk => 
+      axios.post('https://exp.host/--/api/v2/push/send', chunk, {
+        headers: { 
+          'Content-Type': 'application/json',
+          'Accept': 'application/json',
+          'Accept-encoding': 'gzip, deflate'
+        },
+      })
+    );
+
+    await Promise.all(sendPromises);
+
+    console.log(`✅ Broadcast complete: ${usersSnap.size} notifications pushed.`);
+    res.json({ 
+      success: true, 
+      sentCount: usersSnap.size 
+    });
+
+  } catch (error) {
+    console.error('❌ Broadcast Error:', error.message);
+    res.status(500).json({ error: 'Failed to process broadcast' });
+  }
+});
+
 // ============================================
 // ROUTES - PUSH NOTIFICATIONS
 // ============================================
