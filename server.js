@@ -518,10 +518,17 @@ app.post('/api/vtpass/pay', async (req, res) => {
         "Content-Type": "application/json",
       },
     });
+    
+    // Log this to see the response in Render Logs
+    console.log("VTPass Response:", response.data); 
     res.json(response.data);
   } catch (error) {
-    console.error("❌ VTpass Pay Error:", error.response?.data || error.message);
-    res.status(500).json({ error: error.response?.data?.response_description || "VTpass service error" });
+    // This will show you exactly what VTpass said was wrong
+    console.error("❌ VTpass Detailed Error:", error.response?.data || error.message);
+    res.status(500).json({ 
+      error: error.response?.data?.response_description || "VTpass service error",
+      raw: error.response?.data // Sending this back helps you debug on the frontend console
+    });
   }
 });
 
