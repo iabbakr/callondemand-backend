@@ -499,6 +499,96 @@ app.post('/api/notifications/send', async (req, res) => {
   }
 });
 
+
+
+// ============================================
+// ROUTES - VTPASS PROXY (Airtime, Data, Electricity, Education)
+// ============================================
+const VTPASS_BASE_URL = "https://vtpass.com/api"; 
+
+/**
+ * GENERIC VTPASS PAY PROXY
+ */
+app.post('/api/vtpass/pay', async (req, res) => {
+  try {
+    const response = await axios.post(`${VTPASS_BASE_URL}/pay`, req.body, {
+      headers: {
+        "api-key": process.env.VTPASS_API_KEY,
+        "secret-key": process.env.VTPASS_SECRET_KEY,
+        "Content-Type": "application/json",
+      },
+    });
+    res.json(response.data);
+  } catch (error) {
+    console.error("❌ VTpass Pay Error:", error.response?.data || error.message);
+    res.status(500).json({ error: error.response?.data?.response_description || "VTpass service error" });
+  }
+});
+
+/**
+ * VTPASS MERCHANT VERIFICATION (Electricity/TV)
+ */
+app.post('/api/vtpass/verify', async (req, res) => {
+  try {
+    const response = await axios.post(`${VTPASS_BASE_URL}/merchant-verify`, req.body, {
+      headers: {
+        "api-key": process.env.VTPASS_API_KEY,
+        "secret-key": process.env.VTPASS_SECRET_KEY,
+      }
+    });
+    res.json(response.data);
+  } catch (error) {
+    res.status(500).json({ error: "Verification failed" });
+  }
+});
+
+/**
+ * VTPASS REQUERY PROXY
+ */
+app.post('/api/vtpass/requery', async (req, res) => {
+  try {
+    const response = await axios.post(`${VTPASS_BASE_URL}/requery`, req.body, {
+      headers: {
+        "api-key": process.env.VTPASS_API_KEY,
+        "secret-key": process.env.VTPASS_SECRET_KEY,
+      }
+    });
+    res.json(response.data);
+  } catch (error) {
+    res.status(500).json({ error: "Requery failed" });
+  }
+});
+
+/**
+ * VTPASS WEBHOOK (For 099 Pending Transactions)
+ */
+app.post('/api/vtpass/webhook', async (req, res) => {
+  const { requestId, code, amount } = req.body;
+  res.status(200).json({ response: "success" }); // Required by VTpass
+
+  try {
+    if (req.body.type === 'transaction-update') {
+      const txnRef = db.collection('transactions').doc(requestId);
+      const txnSnap = await txnRef.get();
+
+      if (txnSnap.exists && txnSnap.data().status !== 'success') {
+        if (code === '000') {
+          await txnRef.update({ status: 'success', updatedAt: admin.firestore.FieldValue.serverTimestamp() });
+        } else if (code !== '099') {
+          // Refund logic if failed
+          const userId = txnSnap.data().userId;
+          await db.collection('users').doc(userId).update({
+            balance: admin.firestore.FieldValue.increment(txnSnap.data().amount)
+          });
+          await txnRef.update({ status: 'failed' });
+        }
+      }
+    }
+  } catch (e) {
+    console.error("Webhook Logic Error:", e.message);
+  }
+});
+
 // ============================================
 // ERROR HANDLING
 // ============================================
