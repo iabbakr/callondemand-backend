@@ -41,7 +41,6 @@ cloudinary.config({
   api_secret: process.env.CLOUDINARY_API_SECRET,
 });
 
-// Verify Cloudinary config on startup
 console.log('🔧 Cloudinary Config:');
 console.log('Cloud Name:', process.env.CLOUDINARY_CLOUD_NAME ? '✅ Set' : '❌ Missing');
 console.log('API Key:', process.env.CLOUDINARY_API_KEY ? '✅ Set' : '❌ Missing');
@@ -51,25 +50,6 @@ console.log('API Secret:', process.env.CLOUDINARY_API_SECRET ? '✅ Set' : '❌ 
 // MIDDLEWARE
 // ============================================
 app.use(cors());
-
-// ============================================
-// UTILITY FUNCTIONS
-// ============================================
-const sendPushNotification = async (expoPushToken, title, body, data = {}) => {
-  if (!expoPushToken) return;
-  try {
-    await axios.post("https://exp.host/--/api/v2/push/send", {
-      to: expoPushToken,
-      sound: "default",
-      title,
-      body,
-      data,
-    });
-    console.log(`🔔 Notification sent to ${expoPushToken}`);
-  } catch (error) {
-    console.error("❌ Expo Notification Error:", error.message);
-  }
-};
 
 // ============================================
 // ROUTES - HEALTH & MONITORING
@@ -164,13 +144,11 @@ app.post('/api/upload/image', async (req, res) => {
     console.log('📊 File URI length:', fileUri.length);
     console.log('🗑️  Old Public ID:', oldImagePublicId || 'None');
 
-    // Verify Cloudinary config
     if (!process.env.CLOUDINARY_CLOUD_NAME || !process.env.CLOUDINARY_API_KEY || !process.env.CLOUDINARY_API_SECRET) {
       console.error('❌ Cloudinary credentials missing');
       return res.status(500).json({ error: "Cloudinary not configured properly" });
     }
 
-    // Delete old asset if it exists
     if (oldImagePublicId) {
       try {
         console.log('🗑️  Attempting to delete old image:', oldImagePublicId);
@@ -178,7 +156,6 @@ app.post('/api/upload/image', async (req, res) => {
         console.log('🗑️  Delete result:', deleteResult);
       } catch (err) {
         console.warn("⚠️ Cleanup failed:", err.message);
-        // Continue with upload even if deletion fails
       }
     }
 
@@ -201,14 +178,10 @@ app.post('/api/upload/image', async (req, res) => {
       publicId: result.public_id 
     });
   } catch (error) {
-    console.error('❌ Cloudinary Route Error:');
-    console.error('Message:', error.message);
-    console.error('Stack:', error.stack);
-    
+    console.error('❌ Cloudinary Route Error:', error.message);
     res.status(500).json({ 
       error: 'Failed to upload to Cloudinary',
-      message: error.message,
-      details: process.env.NODE_ENV === 'development' ? error.stack : undefined
+      message: error.message
     });
   }
 });
@@ -238,6 +211,49 @@ app.post('/api/paystack/initialize', async (req, res) => {
   } catch (error) {
     console.error('❌ Payment initialization error:', error.message);
     res.status(500).json({ error: 'Payment initialization failed' });
+  }
+});
+
+/**
+ * VERIFY PAYMENT
+ * This endpoint is called by the frontend after payment completion
+ */
+app.post('/api/paystack/verify', async (req, res) => {
+  try {
+    const { reference } = req.body;
+    
+    if (!reference) {
+      return res.status(400).json({ error: 'Reference is required' });
+    }
+
+    // Verify with Paystack
+    const response = await axios.get(
+      `${PAYSTACK_BASE_API}/transaction/verify/${reference}`,
+      { headers: { Authorization: `Bearer ${process.env.PAYSTACK_SECRET_KEY}` } }
+    );
+
+    const verificationData = response.data;
+    
+    if (verificationData.status && verificationData.data.status === 'success') {
+      res.json({
+        success: true,
+        message: 'Payment verified successfully',
+        data: verificationData.data
+      });
+    } else {
+      res.json({
+        success: false,
+        message: 'Payment verification failed',
+        data: verificationData.data
+      });
+    }
+  } catch (error) {
+    console.error('❌ Payment verification error:', error.message);
+    res.status(500).json({ 
+      success: false,
+      error: 'Payment verification failed',
+      message: error.message
+    });
   }
 });
 
@@ -321,9 +337,12 @@ app.get('/api/paystack/resolve', async (req, res) => {
   }
 });
 
+// ============================================
+// ROUTES - PUSH NOTIFICATIONS
+// ============================================
+
 /**
- * SYSTEM BROADCAST (Target all users)
- * Triggered from Admin Dashboard
+ * SYSTEM BROADCAST
  */
 app.post('/api/notifications/broadcast', async (req, res) => {
   try {
@@ -335,7 +354,6 @@ app.post('/api/notifications/broadcast', async (req, res) => {
 
     console.log('📢 Starting system-wide broadcast...');
 
-    // 1. Fetch all users who have a valid push token
     const usersSnap = await db.collection('users')
       .where('expoPushToken', '!=', null)
       .get();
@@ -344,7 +362,6 @@ app.post('/api/notifications/broadcast', async (req, res) => {
       return res.json({ success: true, sentCount: 0, message: 'No devices registered' });
     }
 
-    // 2. Map tokens into Expo message format
     const messages = usersSnap.docs.map(doc => ({
       to: doc.data().expoPushToken,
       sound: 'default',
@@ -357,13 +374,11 @@ app.post('/api/notifications/broadcast', async (req, res) => {
       },
     }));
 
-    // 3. Chunk messages (Expo recommends batches of 100)
     const chunks = [];
     while (messages.length > 0) {
       chunks.push(messages.splice(0, 100));
     }
 
-    // 4. Send chunks to Expo API
     const sendPromises = chunks.map(chunk => 
       axios.post('https://exp.host/--/api/v2/push/send', chunk, {
         headers: { 
@@ -388,10 +403,6 @@ app.post('/api/notifications/broadcast', async (req, res) => {
   }
 });
 
-// ============================================
-// ROUTES - PUSH NOTIFICATIONS
-// ============================================
-
 /**
  * SEND PUSH NOTIFICATION TO SPECIFIC USER
  */
@@ -403,7 +414,6 @@ app.post('/api/notifications/send-to-user', async (req, res) => {
       return res.status(400).json({ error: 'Missing userId or notification' });
     }
 
-    // Get user's push token
     const userDoc = await db.collection('users').doc(userId).get();
     
     if (!userDoc.exists) {
@@ -421,7 +431,6 @@ app.post('/api/notifications/send-to-user', async (req, res) => {
       });
     }
 
-    // Send to Expo Push API
     const message = {
       to: expoPushToken,
       sound: 'default',
@@ -446,7 +455,7 @@ app.post('/api/notifications/send-to-user', async (req, res) => {
 });
 
 /**
- * SEND BULK PUSH NOTIFICATIONS (with filters)
+ * SEND BULK PUSH NOTIFICATIONS
  */
 app.post('/api/notifications/send', async (req, res) => {
   try {
@@ -459,17 +468,15 @@ app.post('/api/notifications/send', async (req, res) => {
     const usersRef = db.collection("users");
     let query = usersRef;
 
-    // Apply filters if they exist
     if (filters?.state) query = query.where("state", "==", filters.state);
     if (filters?.city) query = query.where("city", "==", filters.city);
     if (filters?.role) query = query.where("role", "==", filters.role);
 
     const snap = await query.get();
 
-    // Prepare messages for Expo
     const messages = snap.docs
       .map(d => d.data())
-      .filter(u => u.expoPushToken) // Only users with tokens
+      .filter(u => u.expoPushToken)
       .map(user => ({
         to: user.expoPushToken,
         sound: "default",
@@ -482,7 +489,6 @@ app.post('/api/notifications/send', async (req, res) => {
       return res.json({ success: true, sentCount: 0 });
     }
 
-    // Send to Expo Push API using axios
     await axios.post("https://exp.host/--/api/v2/push/send", messages, {
       headers: { 
         "Content-Type": "application/json",
@@ -499,18 +505,51 @@ app.post('/api/notifications/send', async (req, res) => {
   }
 });
 
-
-
 // ============================================
-// ROUTES - VTPASS PROXY (Airtime, Data, Electricity, Education)
+// ROUTES - VTPASS PROXY
 // ============================================
 const VTPASS_BASE_URL = "https://vtpass.com/api"; 
+
+/**
+ * GET DATA PLANS
+ */
+app.get('/api/vtpass/get-plans', async (req, res) => {
+  const { serviceID } = req.query;
+  
+  if (!serviceID) {
+    return res.status(400).json({ status: false, error: "serviceID is required" });
+  }
+
+  try {
+    const response = await axios.get(
+      `${VTPASS_BASE_URL}/service-variations?serviceID=${serviceID}`,
+      {
+        headers: {
+          "api-key": process.env.VTPASS_API_KEY,
+          "public-key": process.env.VTPASS_PUBLIC_KEY,
+        }
+      }
+    );
+    
+    console.log("✅ VTPass Plans Response:", response.data);
+    res.json({ status: true, data: response.data });
+  } catch (error) {
+    console.error("❌ Get Plans Error:", error.response?.data || error.message);
+    res.status(500).json({ 
+      status: false, 
+      error: "Failed to fetch plans",
+      details: error.response?.data
+    });
+  }
+});
 
 /**
  * GENERIC VTPASS PAY PROXY
  */
 app.post('/api/vtpass/pay', async (req, res) => {
   try {
+    console.log("📤 VTPass Pay Request:", req.body);
+    
     const response = await axios.post(`${VTPASS_BASE_URL}/pay`, req.body, {
       headers: {
         "api-key": process.env.VTPASS_API_KEY,
@@ -519,52 +558,40 @@ app.post('/api/vtpass/pay', async (req, res) => {
       },
     });
     
-    // Log this to see the response in Render Logs
-    console.log("VTPass Response:", response.data); 
+    console.log("✅ VTPass Pay Response:", response.data);
     res.json(response.data);
   } catch (error) {
-    // This will show you exactly what VTpass said was wrong
-    console.error("❌ VTpass Detailed Error:", error.response?.data || error.message);
+    console.error("❌ VTpass Pay Error:", error.response?.data || error.message);
     res.status(500).json({ 
       error: error.response?.data?.response_description || "VTpass service error",
-      raw: error.response?.data // Sending this back helps you debug on the frontend console
+      details: error.response?.data
     });
   }
 });
 
 /**
- * VTPASS MERCHANT VERIFICATION (Electricity/TV)
+ * VTPASS MERCHANT VERIFICATION
  */
 app.post('/api/vtpass/verify', async (req, res) => {
   try {
+    console.log("📤 VTPass Verify Request:", req.body);
+    
     const response = await axios.post(`${VTPASS_BASE_URL}/merchant-verify`, req.body, {
       headers: {
         "api-key": process.env.VTPASS_API_KEY,
         "secret-key": process.env.VTPASS_SECRET_KEY,
+        "Content-Type": "application/json",
       }
     });
+    
+    console.log("✅ VTPass Verify Response:", response.data);
     res.json(response.data);
   } catch (error) {
-    res.status(500).json({ error: "Verification failed" });
-  }
-});
-
-
-app.get('/api/vtpass/get-plans', async (req, res) => {
-  const { serviceID } = req.query;
-  try {
-    const response = await axios.get(
-      `https://vtpass.com/api/service-variations?serviceID=${serviceID}`,
-      {
-        headers: {
-          "api-key": process.env.VTPASS_API_KEY,
-          "public-key": process.env.VTPASS_PUBLIC_KEY,
-        }
-      }
-    );
-    res.json({ status: true, data: response.data });
-  } catch (error) {
-    res.status(500).json({ status: false, error: "Failed to fetch plans" });
+    console.error("❌ VTpass Verify Error:", error.response?.data || error.message);
+    res.status(500).json({ 
+      error: "Verification failed",
+      details: error.response?.data
+    });
   }
 });
 
@@ -585,46 +612,14 @@ app.post('/api/vtpass/requery', async (req, res) => {
   }
 });
 
-/**
- * VTPASS WEBHOOK (For 099 Pending Transactions)
- */
-app.post('/api/vtpass/webhook', async (req, res) => {
-  const { requestId, code, amount } = req.body;
-  res.status(200).json({ response: "success" }); // Required by VTpass
-
-  try {
-    if (req.body.type === 'transaction-update') {
-      const txnRef = db.collection('transactions').doc(requestId);
-      const txnSnap = await txnRef.get();
-
-      if (txnSnap.exists && txnSnap.data().status !== 'success') {
-        if (code === '000') {
-          await txnRef.update({ status: 'success', updatedAt: admin.firestore.FieldValue.serverTimestamp() });
-        } else if (code !== '099') {
-          // Refund logic if failed
-          const userId = txnSnap.data().userId;
-          await db.collection('users').doc(userId).update({
-            balance: admin.firestore.FieldValue.increment(txnSnap.data().amount)
-          });
-          await txnRef.update({ status: 'failed' });
-        }
-      }
-    }
-  } catch (e) {
-    console.error("Webhook Logic Error:", e.message);
-  }
-});
-
 // ============================================
 // ERROR HANDLING
 // ============================================
 
-// 404 Handler
 app.use((req, res) => {
   res.status(404).json({ error: 'Route not found' });
 });
 
-// Global Error Handler
 app.use((err, req, res, next) => {
   console.error('❌ Unhandled Error:', err);
   res.status(500).json({ 
