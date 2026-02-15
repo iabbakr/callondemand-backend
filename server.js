@@ -549,6 +549,25 @@ app.post('/api/vtpass/verify', async (req, res) => {
   }
 });
 
+
+app.get('/api/vtpass/get-plans', async (req, res) => {
+  const { serviceID } = req.query;
+  try {
+    const response = await axios.get(
+      `https://vtpass.com/api/service-variations?serviceID=${serviceID}`,
+      {
+        headers: {
+          "api-key": process.env.VTPASS_API_KEY,
+          "public-key": process.env.VTPASS_PUBLIC_KEY,
+        }
+      }
+    );
+    res.json({ status: true, data: response.data });
+  } catch (error) {
+    res.status(500).json({ status: false, error: "Failed to fetch plans" });
+  }
+});
+
 /**
  * VTPASS REQUERY PROXY
  */
