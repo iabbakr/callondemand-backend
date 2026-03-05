@@ -30,20 +30,50 @@ try {
 // ============================================
 const app = express();
 const PORT = process.env.PORT || 3000;
-const PAYSTACK_BASE_API = 'https://api.paystack.co';
+
+// ============================================
+// MONNIFY CONFIGURATION
+// ============================================
+const MONNIFY_BASE_URL    = 'https://api.monnify.com';
+const MONNIFY_API_KEY     = process.env.MONNIFY_API_KEY;
+const MONNIFY_SECRET_KEY  = process.env.MONNIFY_SECRET_KEY;
+const MONNIFY_CONTRACT    = process.env.MONNIFY_CONTRACT_CODE;
+const MONNIFY_WALLET_ACCT = process.env.MONNIFY_WALLET_ACCOUNT_NUMBER; // 8065933172
+
+const monnifyBasicAuth = () =>
+  'Basic ' + Buffer.from(`${MONNIFY_API_KEY}:${MONNIFY_SECRET_KEY}`).toString('base64');
+
+/**
+ * Get a short-lived Monnify access token (needed for disbursements)
+ */
+async function getMonnifyToken() {
+  const res = await axios.post(
+    `${MONNIFY_BASE_URL}/api/v1/auth/login`,
+    {},
+    { headers: { Authorization: monnifyBasicAuth() } }
+  );
+  if (!res.data.requestSuccessful) throw new Error('Monnify auth failed');
+  return res.data.responseBody.accessToken;
+}
+
+console.log('🔧 Monnify Config:');
+console.log('API Key:         ', MONNIFY_API_KEY     ? '✅ Set' : '❌ Missing');
+console.log('Secret Key:      ', MONNIFY_SECRET_KEY  ? '✅ Set' : '❌ Missing');
+console.log('Contract Code:   ', MONNIFY_CONTRACT    ? '✅ Set' : '❌ Missing');
+console.log('Wallet Account:  ', MONNIFY_WALLET_ACCT ? '✅ Set' : '❌ Missing');
 
 // ============================================
 // CLOUDINARY CONFIGURATION
 // ============================================
 cloudinary.config({
   cloud_name: process.env.CLOUDINARY_CLOUD_NAME,
-  api_key: process.env.CLOUDINARY_API_KEY,
+  api_key:    process.env.CLOUDINARY_API_KEY,
   api_secret: process.env.CLOUDINARY_API_SECRET,
 });
 
 console.log('🔧 Cloudinary Config:');
 console.log('Cloud Name:', process.env.CLOUDINARY_CLOUD_NAME ? '✅ Set' : '❌ Missing');
-console.log('API Key:', process.env.CLOUDINARY_API_KEY ? '✅ Set' : '❌ Missing');
+console.log('API Key:   ', process.env.CLOUDINARY_API_KEY    ? '✅ Set' : '❌ Missing');
 console.log('API Secret:', process.env.CLOUDINARY_API_SECRET ? '✅ Set' : '❌ Missing');
 
 // ============================================
@@ -54,72 +84,79 @@ app.use(cors());
 // ============================================
 // ROUTES - HEALTH & MONITORING
 // ============================================
-
-/**
- * HEALTH CHECK (For Render Monitoring)
- */
 app.get('/health', (req, res) => {
   res.status(200).send('Server is alive');
 });
 
 // ============================================
-// ROUTES - PAYSTACK WEBHOOKS (Raw body parser)
+// ROUTES - MONNIFY WEBHOOK (Raw body parser — BEFORE express.json())
 // ============================================
 
 /**
- * PAYSTACK WEBHOOK
- * Must come BEFORE express.json() middleware
+ * MONNIFY WEBHOOK
+ * Monnify signs with HMAC-SHA512 of the raw body using the secret key.
+ * Header: monnify-signature
  */
-app.post('/api/paystack/webhook', express.raw({ type: 'application/json' }), async (req, res) => {
-  const secret = process.env.PAYSTACK_WEBHOOK_SECRET;
-  const hash = crypto.createHmac('sha512', secret).update(req.body).digest('hex');
-  
-  if (hash !== req.headers['x-paystack-signature']) {
-    return res.status(200).send('Invalid Signature');
-  }
-
-  const event = JSON.parse(req.body.toString());
-  
-  if (event.event === 'charge.success') {
-    const reference = event.data?.reference;
+app.post(
+  '/api/monnify/webhook',
+  express.raw({ type: 'application/json' }),
+  async (req, res) => {
     try {
-      const vRes = await axios.get(`${PAYSTACK_BASE_API}/transaction/verify/${reference}`, {
-        headers: { Authorization: `Bearer ${process.env.PAYSTACK_SECRET_KEY}` }
-      });
-      const verifiedData = vRes.data.data;
+      const signature = req.headers['monnify-signature'];
+      const hash = crypto
+        .createHmac('sha512', MONNIFY_SECRET_KEY)
+        .update(req.body)
+        .digest('hex');
 
-      if (verifiedData.status === 'success') {
-        const amountInNGN = verifiedData.amount / 100;
-        const txnRef = db.collection('transactions').doc(reference);
+      if (hash !== signature) {
+        console.warn('⚠️  Monnify webhook: invalid signature');
+        return res.status(200).send('Invalid Signature');
+      }
+
+      const event = JSON.parse(req.body.toString());
+      console.log('📩 Monnify Webhook event:', event.eventType);
+
+      if (event.eventType === 'SUCCESSFUL_TRANSACTION') {
+        const body         = event.eventData;
+        const payReference = body.paymentReference;   // our reference
+        const txnReference = body.transactionReference; // Monnify's ref
+        const amountPaid   = body.amountPaid;          // NGN (already in naira)
+
+        const txnRef  = db.collection('transactions').doc(payReference);
         const txnSnap = await txnRef.get();
-        
+
         if (!txnSnap.exists || txnSnap.data().status === 'success') {
-          return res.status(200).send('Already processed');
+          return res.status(200).send('Already processed or unknown');
         }
 
-        const userId = txnSnap.data().userId;
+        const userId  = txnSnap.data().userId;
         const userRef = db.collection('users').doc(userId);
 
         await db.runTransaction(async (t) => {
-          t.update(userRef, { balance: admin.firestore.FieldValue.increment(amountInNGN) });
-          t.update(txnRef, { 
-            status: 'success', 
-            verifiedAt: admin.firestore.FieldValue.serverTimestamp() 
+          t.update(userRef, {
+            balance: admin.firestore.FieldValue.increment(amountPaid),
+          });
+          t.update(txnRef, {
+            status:             'success',
+            monnifyReference:   txnReference,
+            amountPaid,
+            verifiedAt:         admin.firestore.FieldValue.serverTimestamp(),
           });
         });
 
-        console.log(`✅ Payment verified: ₦${amountInNGN} for user ${userId}`);
+        console.log(`✅ Webhook credited ₦${amountPaid} for user ${userId}`);
       }
-    } catch (error) {
-      console.error('❌ Webhook Error:', error.message);
+
+      res.status(200).send('Webhook Received');
+    } catch (err) {
+      console.error('❌ Webhook Error:', err.message);
+      res.status(200).send('Webhook Error');
     }
   }
-  
-  res.status(200).send('Webhook Received');
-});
+);
 
 // ============================================
-// JSON BODY PARSER (10MB limit for Base64 images)
+// JSON BODY PARSER (10 MB for Base64 images)
 // ============================================
 app.use(express.json({ limit: '10mb' }));
 
@@ -133,145 +170,158 @@ app.use(express.json({ limit: '10mb' }));
 app.post('/api/upload/image', async (req, res) => {
   try {
     console.log('📥 Received upload request');
-    
-    const { fileUri, oldImagePublicId } = req.body; 
-    
+    const { fileUri, oldImagePublicId } = req.body;
+
     if (!fileUri) {
-      console.error('❌ No image data provided');
-      return res.status(400).json({ error: "No image data provided" });
+      return res.status(400).json({ error: 'No image data provided' });
     }
 
-    console.log('📊 File URI length:', fileUri.length);
+    console.log('📊 Payload size:', Math.round(fileUri.length / 1024), 'KB');
     console.log('🗑️  Old Public ID:', oldImagePublicId || 'None');
 
-    if (!process.env.CLOUDINARY_CLOUD_NAME || !process.env.CLOUDINARY_API_KEY || !process.env.CLOUDINARY_API_SECRET) {
-      console.error('❌ Cloudinary credentials missing');
-      return res.status(500).json({ error: "Cloudinary not configured properly" });
+    if (
+      !process.env.CLOUDINARY_CLOUD_NAME ||
+      !process.env.CLOUDINARY_API_KEY ||
+      !process.env.CLOUDINARY_API_SECRET
+    ) {
+      return res.status(500).json({ error: 'Cloudinary not configured properly' });
     }
 
     if (oldImagePublicId) {
       try {
-        console.log('🗑️  Attempting to delete old image:', oldImagePublicId);
         const deleteResult = await cloudinary.uploader.destroy(oldImagePublicId);
         console.log('🗑️  Delete result:', deleteResult);
       } catch (err) {
-        console.warn("⚠️ Cleanup failed:", err.message);
+        console.warn('⚠️ Cleanup failed:', err.message);
       }
     }
 
     console.log('📤 Uploading to Cloudinary...');
     const result = await cloudinary.uploader.upload(fileUri, {
-  folder: 'profile_pictures',
-  resource_type: 'image',
-  transformation: [
-    { width: 500, height: 500, crop: 'fill', gravity: 'face' }, // 'fill' + 'gravity: face' is key
-    { quality: 'auto' }
-  ]
-});
-
-    console.log('✅ Upload successful!');
-    console.log('URL:', result.secure_url);
-    console.log('Public ID:', result.public_id);
-
-    res.json({ 
-      url: result.secure_url,
-      publicId: result.public_id 
+      folder:        'profile_pictures',
+      resource_type: 'image',
+      transformation: [
+        { width: 500, height: 500, crop: 'fill', gravity: 'face' },
+        { quality: 'auto' },
+      ],
     });
+
+    console.log('✅ Cloudinary upload successful:', result.secure_url);
+    res.json({ url: result.secure_url, publicId: result.public_id });
   } catch (error) {
     console.error('❌ Cloudinary Route Error:', error.message);
-    res.status(500).json({ 
-      error: 'Failed to upload to Cloudinary',
-      message: error.message
-    });
+    res.status(500).json({ error: 'Failed to upload to Cloudinary', message: error.message });
   }
 });
 
 // ============================================
-// ROUTES - PAYSTACK TRANSACTIONS
+// ROUTES - MONNIFY TRANSACTIONS
 // ============================================
 
 /**
- * INITIALIZE PAYMENT
+ * INITIALIZE MONNIFY PAYMENT
+ * Returns a checkoutUrl to open in WebView
  */
-app.post('/api/paystack/initialize', async (req, res) => {
+app.post('/api/monnify/initialize', async (req, res) => {
   try {
-    const { amount, email, reference } = req.body;
-    
+    const { amount, email, customerName, reference } = req.body;
+
     if (!amount || !email || !reference) {
-      return res.status(400).json({ error: 'Missing required fields' });
+      return res.status(400).json({ error: 'Missing required fields: amount, email, reference' });
+    }
+
+    if (!MONNIFY_CONTRACT) {
+      return res.status(500).json({ error: 'MONNIFY_CONTRACT_CODE not configured on server' });
     }
 
     const response = await axios.post(
-      `${PAYSTACK_BASE_API}/transaction/initialize`,
-      { amount: amount * 100, email, reference },
-      { headers: { Authorization: `Bearer ${process.env.PAYSTACK_SECRET_KEY}` } }
-    );
-    
-    res.json(response.data);
-  } catch (error) {
-    console.error('❌ Payment initialization error:', error.message);
-    res.status(500).json({ error: 'Payment initialization failed' });
-  }
-});
-
-/**
- * VERIFY PAYMENT
- * This endpoint is called by the frontend after payment completion
- */
-app.post('/api/paystack/verify', async (req, res) => {
-  try {
-    const { reference } = req.body;
-    
-    if (!reference) {
-      return res.status(400).json({ error: 'Reference is required' });
-    }
-
-    // Verify with Paystack
-    const response = await axios.get(
-      `${PAYSTACK_BASE_API}/transaction/verify/${reference}`,
-      { headers: { Authorization: `Bearer ${process.env.PAYSTACK_SECRET_KEY}` } }
+      `${MONNIFY_BASE_URL}/api/v1/merchant/transactions/init-transaction`,
+      {
+        amount,
+        customerName:       customerName || 'Customer',
+        customerEmail:      email,
+        paymentReference:   reference,
+        paymentDescription: 'Wallet Funding',
+        currencyCode:       'NGN',
+        contractCode:       MONNIFY_CONTRACT,
+        redirectUrl:        'https://callondemand-backend.onrender.com/payment/done',
+        paymentMethods:     ['CARD', 'ACCOUNT_TRANSFER'],
+      },
+      { headers: { Authorization: monnifyBasicAuth() } }
     );
 
-    const verificationData = response.data;
-    
-    if (verificationData.status && verificationData.data.status === 'success') {
-      res.json({
-        success: true,
-        message: 'Payment verified successfully',
-        data: verificationData.data
-      });
-    } else {
-      res.json({
-        success: false,
-        message: 'Payment verification failed',
-        data: verificationData.data
-      });
+    if (!response.data.requestSuccessful) {
+      throw new Error(response.data.responseMessage || 'Monnify init failed');
     }
-  } catch (error) {
-    console.error('❌ Payment verification error:', error.message);
-    res.status(500).json({ 
-      success: false,
-      error: 'Payment verification failed',
-      message: error.message
+
+    const body = response.data.responseBody;
+    res.json({
+      success:            true,
+      checkoutUrl:        body.checkoutUrl,
+      transactionRef:     body.transactionReference,
+      paymentReference:   reference,
     });
+  } catch (error) {
+    console.error('❌ Monnify Init Error:', error.response?.data || error.message);
+    res.status(500).json({ error: 'Payment initialization failed', message: error.message });
   }
 });
 
 /**
- * SECURE WITHDRAWAL
+ * VERIFY MONNIFY PAYMENT
+ * Called by the frontend after WebView redirect
  */
-app.post('/api/paystack/transfer', async (req, res) => {
-  const { userId, amount, recipientCode } = req.body;
-  
-  if (!userId || !amount || !recipientCode) {
+app.post('/api/monnify/verify', async (req, res) => {
+  try {
+    const { transactionReference } = req.body;
+
+    if (!transactionReference) {
+      return res.status(400).json({ error: 'transactionReference is required' });
+    }
+
+    // Monnify verify endpoint requires the transactionReference URL-encoded
+    const encoded  = encodeURIComponent(transactionReference);
+    const response = await axios.get(
+      `${MONNIFY_BASE_URL}/api/v2/transactions/${encoded}`,
+      { headers: { Authorization: monnifyBasicAuth() } }
+    );
+
+    if (!response.data.requestSuccessful) {
+      return res.json({ success: false, message: 'Verification failed' });
+    }
+
+    const txn = response.data.responseBody;
+    res.json({
+      success:            txn.paymentStatus === 'PAID',
+      paymentStatus:      txn.paymentStatus,
+      amountPaid:         txn.amountPaid,
+      paymentReference:   txn.paymentReference,
+      transactionReference: txn.transactionReference,
+      data:               txn,
+    });
+  } catch (error) {
+    console.error('❌ Monnify Verify Error:', error.response?.data || error.message);
+    res.status(500).json({ success: false, error: 'Verification failed', message: error.message });
+  }
+});
+
+/**
+ * SECURE WITHDRAWAL via Monnify Disbursements
+ * Requires destinationBankCode + destinationAccountNumber
+ */
+app.post('/api/monnify/transfer', async (req, res) => {
+  const { userId, amount, destinationBankCode, destinationAccountNumber, narration } = req.body;
+
+  if (!userId || !amount || !destinationBankCode || !destinationAccountNumber) {
     return res.status(400).json({ error: 'Missing required fields' });
   }
 
-  const userRef = db.collection('users').doc(userId);
+  const userRef    = db.collection('users').doc(userId);
   const transferId = `WITHDRAW-${Date.now()}`;
 
   try {
-    const result = await db.runTransaction(async (t) => {
+    // 1. Deduct from Firestore balance atomically
+    await db.runTransaction(async (t) => {
       const userSnap = await t.get(userRef);
       if (!userSnap.exists) throw new Error('User not found');
 
@@ -280,60 +330,109 @@ app.post('/api/paystack/transfer', async (req, res) => {
 
       t.update(userRef, { balance: admin.firestore.FieldValue.increment(-amount) });
 
-      const pRes = await axios.post(
-        `${PAYSTACK_BASE_API}/transfer`, 
-        {
-          source: "balance",
-          amount: amount * 100,
-          recipient: recipientCode,
-          reason: "Wallet Withdrawal",
-          reference: transferId
-        }, 
-        {
-          headers: { Authorization: `Bearer ${process.env.PAYSTACK_SECRET_KEY}` }
-        }
-      );
-
       const txnRef = db.collection('transactions').doc(transferId);
       t.set(txnRef, {
-        userId, 
-        amount, 
-        type: 'debit', 
-        status: 'success',
-        category: 'Withdrawal', 
-        createdAt: admin.firestore.FieldValue.serverTimestamp()
+        userId,
+        amount,
+        type:      'debit',
+        status:    'processing',
+        category:  'Withdrawal',
+        createdAt: admin.firestore.FieldValue.serverTimestamp(),
       });
-
-      return pRes.data;
     });
-    
+
+    // 2. Initiate Monnify disbursement
+    const token = await getMonnifyToken();
+
+    const disbursement = await axios.post(
+      `${MONNIFY_BASE_URL}/api/v2/disbursements/single`,
+      {
+        amount,
+        reference:                  transferId,
+        narration:                  narration || 'Wallet Withdrawal',
+        destinationBankCode,
+        destinationAccountNumber,
+        currency:                   'NGN',
+        sourceAccountNumber:        MONNIFY_WALLET_ACCT,
+        destinationAccountName:     '',
+      },
+      { headers: { Authorization: `Bearer ${token}` } }
+    );
+
+    // 3. Update transaction to success
+    await db.collection('transactions').doc(transferId).update({
+      status:             'success',
+      monnifyReference:   disbursement.data.responseBody?.reference || transferId,
+      disbursedAt:        admin.firestore.FieldValue.serverTimestamp(),
+    });
+
     console.log(`✅ Withdrawal successful: ₦${amount} for user ${userId}`);
-    res.json({ status: true, data: result });
+    res.json({ status: true, data: disbursement.data.responseBody });
   } catch (error) {
-    console.error('❌ Withdrawal error:', error.message);
-    res.status(400).json({ error: error.message });
+    console.error('❌ Withdrawal Error:', error.response?.data || error.message);
+
+    // Reverse balance if disbursement failed but Firestore already debited
+    try {
+      await userRef.update({
+        balance: admin.firestore.FieldValue.increment(amount),
+      });
+      await db.collection('transactions').doc(transferId).update({ status: 'failed' });
+      console.log('↩️  Balance reversed after failed disbursement');
+    } catch (reverseErr) {
+      console.error('❌ CRITICAL: Reversal failed:', reverseErr.message);
+    }
+
+    res.status(400).json({ error: error.response?.data?.responseMessage || error.message });
   }
 });
 
 /**
- * RESOLVE BANK ACCOUNT
+ * RESOLVE BANK ACCOUNT (via Monnify)
  */
-app.get('/api/paystack/resolve', async (req, res) => {
+app.get('/api/monnify/resolve', async (req, res) => {
   const { account_number, bank_code } = req.query;
-  
+
   if (!account_number || !bank_code) {
     return res.status(400).json({ error: 'Missing account_number or bank_code' });
   }
 
   try {
     const response = await axios.get(
-      `${PAYSTACK_BASE_API}/bank/resolve?account_number=${account_number}&bank_code=${bank_code}`,
-      { headers: { Authorization: `Bearer ${process.env.PAYSTACK_SECRET_KEY}` } }
+      `${MONNIFY_BASE_URL}/api/v1/disbursements/account/validate?accountNumber=${account_number}&bankCode=${bank_code}`,
+      { headers: { Authorization: monnifyBasicAuth() } }
     );
-    res.json(response.data);
+
+    if (response.data.requestSuccessful) {
+      res.json({
+        status: true,
+        data: {
+          account_name:   response.data.responseBody.accountName,
+          account_number: response.data.responseBody.accountNumber,
+          bank_code,
+        },
+      });
+    } else {
+      res.json({ status: false, message: response.data.responseMessage });
+    }
   } catch (error) {
-    console.error('❌ Account resolution error:', error.message);
+    console.error('❌ Account resolution error:', error.response?.data || error.message);
     res.status(500).json({ error: 'Account resolution failed' });
+  }
+});
+
+/**
+ * GET SUPPORTED BANKS (via Monnify)
+ */
+app.get('/api/monnify/banks', async (req, res) => {
+  try {
+    const response = await axios.get(
+      `${MONNIFY_BASE_URL}/api/v1/sdk/transactions/banks`,
+      { headers: { Authorization: monnifyBasicAuth() } }
+    );
+    res.json({ status: true, data: response.data.responseBody });
+  } catch (error) {
+    console.error('❌ Banks fetch error:', error.response?.data || error.message);
+    res.status(500).json({ error: 'Failed to fetch banks' });
   }
 });
 
@@ -352,8 +451,6 @@ app.post('/api/notifications/broadcast', async (req, res) => {
       return res.status(400).json({ error: 'Title and Body are required' });
     }
 
-    console.log('📢 Starting system-wide broadcast...');
-
     const usersSnap = await db.collection('users')
       .where('expoPushToken', '!=', null)
       .get();
@@ -363,40 +460,31 @@ app.post('/api/notifications/broadcast', async (req, res) => {
     }
 
     const messages = usersSnap.docs.map(doc => ({
-      to: doc.data().expoPushToken,
+      to:    doc.data().expoPushToken,
       sound: 'default',
-      title: title,
-      body: body,
-      data: { 
-        ...data, 
-        type: type || 'admin_notification',
-        sentAt: new Date().toISOString() 
-      },
+      title,
+      body,
+      data: { ...data, type: type || 'admin_notification', sentAt: new Date().toISOString() },
     }));
 
     const chunks = [];
-    while (messages.length > 0) {
-      chunks.push(messages.splice(0, 100));
-    }
+    const copy = [...messages];
+    while (copy.length > 0) chunks.push(copy.splice(0, 100));
 
-    const sendPromises = chunks.map(chunk => 
-      axios.post('https://exp.host/--/api/v2/push/send', chunk, {
-        headers: { 
-          'Content-Type': 'application/json',
-          'Accept': 'application/json',
-          'Accept-encoding': 'gzip, deflate'
-        },
-      })
+    await Promise.all(
+      chunks.map(chunk =>
+        axios.post('https://exp.host/--/api/v2/push/send', chunk, {
+          headers: {
+            'Content-Type': 'application/json',
+            'Accept': 'application/json',
+            'Accept-encoding': 'gzip, deflate',
+          },
+        })
+      )
     );
 
-    await Promise.all(sendPromises);
-
     console.log(`✅ Broadcast complete: ${usersSnap.size} notifications pushed.`);
-    res.json({ 
-      success: true, 
-      sentCount: usersSnap.size 
-    });
-
+    res.json({ success: true, sentCount: usersSnap.size });
   } catch (error) {
     console.error('❌ Broadcast Error:', error.message);
     res.status(500).json({ error: 'Failed to process broadcast' });
@@ -409,44 +497,24 @@ app.post('/api/notifications/broadcast', async (req, res) => {
 app.post('/api/notifications/send-to-user', async (req, res) => {
   try {
     const { userId, notification } = req.body;
-
     if (!userId || !notification) {
       return res.status(400).json({ error: 'Missing userId or notification' });
     }
 
     const userDoc = await db.collection('users').doc(userId).get();
-    
-    if (!userDoc.exists) {
-      return res.status(404).json({ error: 'User not found' });
-    }
+    if (!userDoc.exists) return res.status(404).json({ error: 'User not found' });
 
-    const userData = userDoc.data();
-    const expoPushToken = userData.expoPushToken;
-
+    const expoPushToken = userDoc.data().expoPushToken;
     if (!expoPushToken) {
-      return res.json({ 
-        success: true, 
-        sentCount: 0, 
-        message: 'User has no push token' 
-      });
+      return res.json({ success: true, sentCount: 0, message: 'User has no push token' });
     }
 
-    const message = {
-      to: expoPushToken,
-      sound: 'default',
-      title: notification.title,
-      body: notification.body,
-      data: notification.data ?? {},
-    };
+    await axios.post(
+      'https://exp.host/--/api/v2/push/send',
+      { to: expoPushToken, sound: 'default', title: notification.title, body: notification.body, data: notification.data ?? {} },
+      { headers: { 'Content-Type': 'application/json', 'Accept': 'application/json' } }
+    );
 
-    await axios.post('https://exp.host/--/api/v2/push/send', message, {
-      headers: { 
-        'Content-Type': 'application/json',
-        'Accept': 'application/json',
-      },
-    });
-
-    console.log(`🔔 Push notification sent to user ${userId}`);
     res.json({ success: true, sentCount: 1 });
   } catch (error) {
     console.error('❌ User Notification Error:', error.message);
@@ -460,44 +528,31 @@ app.post('/api/notifications/send-to-user', async (req, res) => {
 app.post('/api/notifications/send', async (req, res) => {
   try {
     const { filters, notification } = req.body;
-    
-    if (!notification) {
-      return res.status(400).json({ error: 'Missing notification' });
-    }
+    if (!notification) return res.status(400).json({ error: 'Missing notification' });
 
-    const usersRef = db.collection("users");
-    let query = usersRef;
-
-    if (filters?.state) query = query.where("state", "==", filters.state);
-    if (filters?.city) query = query.where("city", "==", filters.city);
-    if (filters?.role) query = query.where("role", "==", filters.role);
+    let query = db.collection('users');
+    if (filters?.state) query = query.where('state', '==', filters.state);
+    if (filters?.city)  query = query.where('city',  '==', filters.city);
+    if (filters?.role)  query = query.where('role',  '==', filters.role);
 
     const snap = await query.get();
-
     const messages = snap.docs
       .map(d => d.data())
       .filter(u => u.expoPushToken)
       .map(user => ({
-        to: user.expoPushToken,
-        sound: "default",
+        to:    user.expoPushToken,
+        sound: 'default',
         title: notification.title,
-        body: notification.body,
-        data: notification.data ?? {},
+        body:  notification.body,
+        data:  notification.data ?? {},
       }));
 
-    if (messages.length === 0) {
-      return res.json({ success: true, sentCount: 0 });
-    }
+    if (messages.length === 0) return res.json({ success: true, sentCount: 0 });
 
-    await axios.post("https://exp.host/--/api/v2/push/send", messages, {
-      headers: { 
-        "Content-Type": "application/json",
-        "Accept": "application/json",
-        "Accept-encoding": "gzip, deflate"
-      },
+    await axios.post('https://exp.host/--/api/v2/push/send', messages, {
+      headers: { 'Content-Type': 'application/json', 'Accept': 'application/json', 'Accept-encoding': 'gzip, deflate' },
     });
 
-    console.log(`🔔 Bulk notifications sent to ${messages.length} users`);
     res.json({ success: true, sentCount: messages.length });
   } catch (error) {
     console.error('❌ Bulk Notification Error:', error.message);
@@ -506,125 +561,81 @@ app.post('/api/notifications/send', async (req, res) => {
 });
 
 // ============================================
-// ROUTES - VTPASS PROXY
+// ROUTES - VTPASS PROXY (Airtime / Data / Electricity)
 // ============================================
-const VTPASS_BASE_URL = "https://vtpass.com/api"; 
+const VTPASS_BASE_URL = 'https://vtpass.com/api';
 
-/**
- * GET DATA PLANS
- */
 app.get('/api/vtpass/get-plans', async (req, res) => {
   const { serviceID } = req.query;
-  
-  if (!serviceID) {
-    return res.status(400).json({ status: false, error: "serviceID is required" });
-  }
+  if (!serviceID) return res.status(400).json({ status: false, error: 'serviceID is required' });
 
   try {
     const response = await axios.get(
       `${VTPASS_BASE_URL}/service-variations?serviceID=${serviceID}`,
-      {
-        headers: {
-          "api-key": process.env.VTPASS_API_KEY,
-          "public-key": process.env.VTPASS_PUBLIC_KEY,
-        }
-      }
+      { headers: { 'api-key': process.env.VTPASS_API_KEY, 'public-key': process.env.VTPASS_PUBLIC_KEY } }
     );
-    
-    console.log("✅ VTPass Plans Response:", response.data);
     res.json({ status: true, data: response.data });
   } catch (error) {
-    console.error("❌ Get Plans Error:", error.response?.data || error.message);
-    res.status(500).json({ 
-      status: false, 
-      error: "Failed to fetch plans",
-      details: error.response?.data
-    });
+    console.error('❌ Get Plans Error:', error.response?.data || error.message);
+    res.status(500).json({ status: false, error: 'Failed to fetch plans', details: error.response?.data });
   }
 });
 
-/**
- * GENERIC VTPASS PAY PROXY
- */
 app.post('/api/vtpass/pay', async (req, res) => {
   try {
-    console.log("📤 VTPass Pay Request:", req.body);
-    
     const response = await axios.post(`${VTPASS_BASE_URL}/pay`, req.body, {
       headers: {
-        "api-key": process.env.VTPASS_API_KEY,
-        "secret-key": process.env.VTPASS_SECRET_KEY,
-        "Content-Type": "application/json",
+        'api-key':    process.env.VTPASS_API_KEY,
+        'secret-key': process.env.VTPASS_SECRET_KEY,
+        'Content-Type': 'application/json',
       },
     });
-    
-    console.log("✅ VTPass Pay Response:", response.data);
     res.json(response.data);
   } catch (error) {
-    console.error("❌ VTpass Pay Error:", error.response?.data || error.message);
-    res.status(500).json({ 
-      error: error.response?.data?.response_description || "VTpass service error",
-      details: error.response?.data
-    });
+    console.error('❌ VTpass Pay Error:', error.response?.data || error.message);
+    res.status(500).json({ error: error.response?.data?.response_description || 'VTpass service error', details: error.response?.data });
   }
 });
 
-/**
- * VTPASS MERCHANT VERIFICATION
- */
 app.post('/api/vtpass/verify', async (req, res) => {
   try {
-    console.log("📤 VTPass Verify Request:", req.body);
-    
     const response = await axios.post(`${VTPASS_BASE_URL}/merchant-verify`, req.body, {
       headers: {
-        "api-key": process.env.VTPASS_API_KEY,
-        "secret-key": process.env.VTPASS_SECRET_KEY,
-        "Content-Type": "application/json",
-      }
+        'api-key':    process.env.VTPASS_API_KEY,
+        'secret-key': process.env.VTPASS_SECRET_KEY,
+        'Content-Type': 'application/json',
+      },
     });
-    
-    console.log("✅ VTPass Verify Response:", response.data);
     res.json(response.data);
   } catch (error) {
-    console.error("❌ VTpass Verify Error:", error.response?.data || error.message);
-    res.status(500).json({ 
-      error: "Verification failed",
-      details: error.response?.data
-    });
+    console.error('❌ VTpass Verify Error:', error.response?.data || error.message);
+    res.status(500).json({ error: 'Verification failed', details: error.response?.data });
   }
 });
 
-/**
- * VTPASS REQUERY PROXY
- */
 app.post('/api/vtpass/requery', async (req, res) => {
   try {
     const response = await axios.post(`${VTPASS_BASE_URL}/requery`, req.body, {
-      headers: {
-        "api-key": process.env.VTPASS_API_KEY,
-        "secret-key": process.env.VTPASS_SECRET_KEY,
-      }
+      headers: { 'api-key': process.env.VTPASS_API_KEY, 'secret-key': process.env.VTPASS_SECRET_KEY },
     });
     res.json(response.data);
   } catch (error) {
-    res.status(500).json({ error: "Requery failed" });
+    res.status(500).json({ error: 'Requery failed' });
   }
 });
 
 // ============================================
 // ERROR HANDLING
 // ============================================
-
 app.use((req, res) => {
   res.status(404).json({ error: 'Route not found' });
 });
 
 app.use((err, req, res, next) => {
   console.error('❌ Unhandled Error:', err);
-  res.status(500).json({ 
-    error: 'Internal server error',
-    message: process.env.NODE_ENV === 'development' ? err.message : undefined
+  res.status(500).json({
+    error:   'Internal server error',
+    message: process.env.NODE_ENV === 'development' ? err.message : undefined,
   });
 });
 
