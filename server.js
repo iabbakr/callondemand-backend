@@ -161,13 +161,13 @@ app.post('/api/upload/image', async (req, res) => {
 
     console.log('📤 Uploading to Cloudinary...');
     const result = await cloudinary.uploader.upload(fileUri, {
-      folder: 'profile_pictures',
-      resource_type: 'image',
-      transformation: [
-        { width: 500, height: 500, crop: 'limit' },
-        { quality: 'auto' }
-      ]
-    });
+  folder: 'profile_pictures',
+  resource_type: 'image',
+  transformation: [
+    { width: 500, height: 500, crop: 'fill', gravity: 'face' }, // 'fill' + 'gravity: face' is key
+    { quality: 'auto' }
+  ]
+});
 
     console.log('✅ Upload successful!');
     console.log('URL:', result.secure_url);
